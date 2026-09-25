@@ -217,8 +217,8 @@ async function connect() {
     if (qr) {
       state.qr = qr;
       state.connected = false;
-      console.log("\n[whatsapp] Escaneie este QR Code para conectar:");
-      qrcodeTerminal.generate(qr, { small: true });
+      console.log("[whatsapp] QR Code pronto. Abra o domínio público do serviço e informe o código de pareamento mostrado acima.");
+      if (process.env.PRINT_QR_TERMINAL === "true") qrcodeTerminal.generate(qr, { small: true });
     }
 
     if (connection === "open") {
@@ -253,4 +253,3 @@ connect().catch((error) => {
   logger.fatal({ error }, "Não foi possível iniciar o WhatsApp");
   process.exitCode = 1;
 });
-
