@@ -91,7 +91,7 @@ function allowedMedia(media) {
   return mime.includes("pdf") || /^image\/(?:jpeg|jpg|png)$/.test(mime) || /\.(pdf|jpe?g|png)$/i.test(media.fileName || "");
 }
 
-function entryReply(entry, duplicate) {
+function entryReply(entry, duplicate, agendaMatch) {
   if (duplicate) {
     return [
       "♻️ *COMPROVANTE REPETIDO*",
@@ -117,6 +117,16 @@ function entryReply(entry, duplicate) {
   if (entry.receipt?.bank) lines.push(`Banco: ${entry.receipt.bank}`);
   if (entry.receipt?.transactionSuffix) lines.push(`Transação final: ${entry.receipt.transactionSuffix}`);
   if (entry.warnings?.length) lines.push("", ...entry.warnings.map((warning) => `• ${warning}`));
+  if (agendaMatch) {
+    lines.push(
+      "",
+      `📅 Agenda cruzada: *${agendaMatch.agendaId}*`,
+      `Cliente previsto: ${agendaMatch.clientName}`,
+      `Situação na agenda: ${agendaMatch.status === "settled" ? "QUITADO"
+        : agendaMatch.status === "paid" ? "PAGO CONFIRMADO"
+          : agendaMatch.status === "receipt_review" ? "COMPROVANTE EM REVISÃO" : "COMPROVANTE CRUZADO"}`
+    );
+  }
   lines.push("", entry.status === "needs_review"
     ? "Confira o comprovante antes de considerar o valor recebido."
     : "📄 Leitura concluída. A confirmação bancária é uma etapa separada.");
@@ -127,7 +137,7 @@ function contextKey(message) {
   return `${message.key.remoteJid}|${message.key.participant || message.participant || "sem-remetente"}`;
 }
 
-export function createFinancialHandler({ ledger, logger, getSocket, sendText }) {
+export function createFinancialHandler({ ledger, agendaLedger, logger, getSocket, sendText }) {
   const pendingContext = new Map();
 
   function rememberContext(message, text) {
@@ -223,8 +233,11 @@ export function createFinancialHandler({ ledger, logger, getSocket, sendText }) 
       }
     });
 
-    await sendText(jid, entryReply(result.entry, result.duplicate));
-    return { handled: true, ...result };
+    const agendaMatch = !result.duplicate && agendaLedger
+      ? await agendaLedger.matchPayment(result.entry)
+      : null;
+    await sendText(jid, entryReply(result.entry, result.duplicate, agendaMatch));
+    return { handled: true, agendaMatch, ...result };
   }
 
   return { handle };
