@@ -8,6 +8,8 @@ import makeWASocket, {
 import cron from "node-cron";
 import pino from "pino";
 import qrcodeTerminal from "qrcode-terminal";
+import { createAgendaHandler } from "./agenda-handler.js";
+import { AgendaLedger, formatAgendaSummary } from "./agenda-ledger.js";
 import { createFinancialHandler, textFromMessage } from "./financial-handler.js";
 import { FinanceLedger, formatFinanceSummary, localDateKey } from "./finance-ledger.js";
 import { terminateOcr } from "./receipt-parser.js";
@@ -29,10 +31,16 @@ const groupDefinitions = {
   outgoing: {
     name: process.env.WHATSAPP_OUTGOING_GROUP_NAME || "Saídas Prime Capital",
     jid: process.env.WHATSAPP_OUTGOING_GROUP_JID || ""
+  },
+  agenda: {
+    name: process.env.WHATSAPP_AGENDA_GROUP_NAME || "Grupo agenda",
+    jid: process.env.WHATSAPP_AGENDA_GROUP_JID || ""
   }
 };
 const ledgerPath = path.resolve(process.env.LEDGER_PATH || path.join(path.dirname(authDir), "prime-capital-finance.json"));
 const ledger = new FinanceLedger({ filePath: ledgerPath, timezone });
+const agendaLedgerPath = path.resolve(process.env.AGENDA_LEDGER_PATH || path.join(path.dirname(authDir), "prime-capital-agendas.json"));
+const agendaLedger = new AgendaLedger({ filePath: agendaLedgerPath, timezone });
 const state = { connected: false, qr: null };
 
 let socket;
@@ -143,9 +151,30 @@ function startSchedules() {
     try {
       const jid = await resolveGroup("report");
       if (!jid) return;
-      await sendText(jid, formatFinanceSummary(await ledger.summary()));
+      await sendText(jid, [
+        formatFinanceSummary(await ledger.summary()),
+        "",
+        formatAgendaSummary(await agendaLedger.summary())
+      ].join("\n"));
     } catch (error) {
       logger.error({ error }, "Falha no resumo financeiro automático");
+    }
+  }, { timezone });
+
+  cron.schedule("0 7 * * 1-6", async () => {
+    try {
+      const jid = await resolveGroup("agenda");
+      if (!jid) return;
+      await sendText(jid, [
+        "📅 *BOM DIA — ENVIO DAS AGENDAS*",
+        "",
+        "Cada atendente deve enviar a foto da agenda com a legenda:",
+        "*AGENDA RP2 - CARLA - 27/09/2026*",
+        "",
+        "Depois da leitura, confira e use /confirmaragenda CÓDIGO."
+      ].join("\n"));
+    } catch (error) {
+      logger.error({ error }, "Falha no lembrete das agendas");
     }
   }, { timezone });
 
@@ -154,9 +183,18 @@ function startSchedules() {
 
 const financialHandler = createFinancialHandler({
   ledger,
+  agendaLedger,
   logger,
   getSocket: () => socket,
   sendText
+});
+const agendaHandler = createAgendaHandler({
+  agendaLedger,
+  logger,
+  getSocket: () => socket,
+  sendText,
+  timezone,
+  groupName: groupDefinitions.agenda.name
 });
 const financeNumbers = String(process.env.FINANCE_WHATSAPP_NUMBERS || "")
   .split(",")
@@ -190,6 +228,20 @@ async function sendPending(jid) {
   ].join("\n"));
 }
 
+async function sendAgendaPending(jid, line) {
+  const pending = await agendaLedger.pending({ line, limit: 40 });
+  if (!pending.length) {
+    await sendText(jid, `✅ Nenhum cliente pendente na agenda${line ? ` da ${line}` : ""} hoje.`);
+    return;
+  }
+  const formatter = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
+  await sendText(jid, [
+    `📅 *PENDÊNCIAS DA AGENDA${line ? ` — ${line}` : ""}*`,
+    "",
+    ...pending.map((entry) => `• ${entry.line} — ${entry.time || "sem horário"} — ${entry.clientName} — ${entry.expectedAmount != null ? formatter.format(entry.expectedAmount) : "sem valor"}${entry.status === "receipt_read" ? " — 📄 comprovante lido" : entry.status === "receipt_review" ? " — ⚠️ comprovante em revisão" : ""}`)
+  ].join("\n"));
+}
+
 async function handleCommand(message, role) {
   const jid = message.key.remoteJid;
   const text = textFromMessage(message);
@@ -214,6 +266,10 @@ async function handleCommand(message, role) {
       "/saidas — comprovantes de saída do dia",
       "/pendentes — comprovantes que precisam de revisão",
       "/confirmar CÓDIGO — confirmar após conferir no banco",
+      "/agenda — previsto, recebido e pendente das agendas",
+      "/pendenciasagenda — clientes da agenda ainda sem pagamento",
+      "/confirmaragenda CÓDIGO — salvar a agenda após conferir",
+      "/cancelaragenda CÓDIGO — descartar uma leitura incorreta",
       "/status — verificar conexão"
     ].join("\n"));
     return true;
@@ -236,6 +292,42 @@ async function handleCommand(message, role) {
     return true;
   }
 
+  if (command === "/agenda" || command === "/pendenciasagenda") {
+    const requested = text.match(/\b(?:rp|l)\s*([1-5])\b/i)?.[1];
+    const line = requested ? `RP${requested}` : undefined;
+    if (command === "/agenda") await sendText(jid, formatAgendaSummary(await agendaLedger.summary({ line })));
+    else await sendAgendaPending(jid, line);
+    return true;
+  }
+
+  if (command === "/confirmaragenda" || command === "/cancelaragenda") {
+    const sender = senderNumber(message);
+    let id = text.split(/\s+/)[1];
+    if (!id) id = (await agendaLedger.latestDraft({ sender, groupJid: jid }))?.id;
+    if (!id) {
+      await sendText(jid, `Use: ${command} CÓDIGO`);
+      return true;
+    }
+    const result = command === "/confirmaragenda"
+      ? await agendaLedger.confirm(id, sender)
+      : await agendaLedger.cancel(id, sender);
+    if (result.error === "forbidden") {
+      await sendText(jid, "🔒 Apenas a atendente que enviou a foto pode confirmar ou cancelar esta agenda.");
+    } else if (result.error) {
+      await sendText(jid, `❌ Agenda *${id}* não encontrada ou indisponível.`);
+    } else if (command === "/confirmaragenda") {
+      await sendText(jid, [
+        `✅ Agenda *${result.agenda.id}* confirmada e salva.`,
+        "Os comprovantes de entrada já poderão ser cruzados com esses clientes.",
+        "",
+        formatAgendaSummary(await agendaLedger.summary({ line: result.agenda.line }))
+      ].join("\n"));
+    } else {
+      await sendText(jid, `🗑️ Leitura *${result.agenda.id}* cancelada. Envie uma nova foto mais nítida.`);
+    }
+    return true;
+  }
+
   if (command === "/confirmar") {
     if (!financeNumbers.length) {
       await sendText(jid, "🔒 A confirmação bancária ainda não tem números autorizados configurados.");
@@ -251,6 +343,7 @@ async function handleCommand(message, role) {
       return true;
     }
     const confirmed = await ledger.confirm(id, senderNumber(message));
+    if (confirmed) await agendaLedger.confirmMatchedPayment(confirmed);
     await sendText(jid, confirmed
       ? `✅ *${confirmed.id}* confirmado após conferência bancária.`
       : `❌ Código *${id}* não encontrado.`);
@@ -283,6 +376,11 @@ async function handleMessage(message) {
   if (text.startsWith("/") && await handleCommand(message, role)) return;
   if (role === "report") return;
 
+  if (role === "agenda") {
+    await agendaHandler.handle(message);
+    return;
+  }
+
   const kind = role === "incoming" ? "incoming" : "outgoing";
   await financialHandler.handle(message, { kind, groupName: groupDefinitions[role].name });
 }
@@ -313,7 +411,7 @@ async function connect() {
         logger.error({ error }, "Falha ao processar mensagem");
         const jid = message.key.remoteJid;
         if (jid?.endsWith("@g.us")) {
-          await sendText(jid, `❌ Não foi possível ler este comprovante: ${error.message || "erro desconhecido"}`).catch(() => {});
+          await sendText(jid, `❌ Não foi possível processar esta mensagem: ${error.message || "erro desconhecido"}`).catch(() => {});
         }
       }
     }
@@ -367,7 +465,8 @@ process.once("SIGINT", () => shutdown("SIGINT"));
 
 async function main() {
   await ledger.initialize();
-  startServer(state, { ledger });
+  await agendaLedger.initialize();
+  startServer(state, { ledger, agendaLedger });
   await connect();
 }
 
