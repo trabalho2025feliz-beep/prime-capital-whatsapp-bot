@@ -8,22 +8,36 @@ import makeWASocket, {
 import cron from "node-cron";
 import pino from "pino";
 import qrcodeTerminal from "qrcode-terminal";
+import { createFinancialHandler, textFromMessage } from "./financial-handler.js";
+import { FinanceLedger, formatFinanceSummary, localDateKey } from "./finance-ledger.js";
+import { terminateOcr } from "./receipt-parser.js";
 import { fetchReport } from "./report-client.js";
 import { startServer } from "./server.js";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 const authDir = path.resolve(process.env.AUTH_DIR || "./auth");
-const groupName = process.env.WHATSAPP_GROUP_NAME || "Relatórios Prime Capital";
-const configuredGroupJid = process.env.WHATSAPP_GROUP_JID || "";
 const timezone = process.env.TZ || "America/Sao_Paulo";
+const groupDefinitions = {
+  report: {
+    name: process.env.WHATSAPP_GROUP_NAME || "Relatórios Prime Capital",
+    jid: process.env.WHATSAPP_GROUP_JID || ""
+  },
+  incoming: {
+    name: process.env.WHATSAPP_INCOMING_GROUP_NAME || "Entradas Prime Capital",
+    jid: process.env.WHATSAPP_INCOMING_GROUP_JID || ""
+  },
+  outgoing: {
+    name: process.env.WHATSAPP_OUTGOING_GROUP_NAME || "Saídas Prime Capital",
+    jid: process.env.WHATSAPP_OUTGOING_GROUP_JID || ""
+  }
+};
+const ledgerPath = path.resolve(process.env.LEDGER_PATH || path.join(path.dirname(authDir), "prime-capital-finance.json"));
+const ledger = new FinanceLedger({ filePath: ledgerPath, timezone });
 const state = { connected: false, qr: null };
 
 let socket;
-let targetGroupJid = configuredGroupJid;
 let reconnectTimer;
 let schedulesStarted = false;
-
-startServer(state);
 
 function normalize(value) {
   return String(value || "")
@@ -31,19 +45,6 @@ function normalize(value) {
     .replace(/[\u0300-\u036f]/g, "")
     .trim()
     .toLowerCase();
-}
-
-function extractText(message) {
-  let content = message.message || {};
-  content = content.ephemeralMessage?.message || content;
-  content = content.viewOnceMessage?.message || content.viewOnceMessageV2?.message || content;
-  return String(
-    content.conversation ||
-    content.extendedTextMessage?.text ||
-    content.imageMessage?.caption ||
-    content.videoMessage?.caption ||
-    ""
-  ).trim();
 }
 
 function splitMessage(text, limit = 3900) {
@@ -60,41 +61,44 @@ function splitMessage(text, limit = 3900) {
   return parts;
 }
 
-async function resolveTargetGroup() {
-  if (targetGroupJid) return targetGroupJid;
+async function resolveGroup(role) {
+  const definition = groupDefinitions[role];
+  if (!definition) return null;
+  if (definition.jid) return definition.jid;
   if (!socket || !state.connected) return null;
 
   const groups = await socket.groupFetchAllParticipating();
-  const matches = Object.values(groups).filter((group) => normalize(group.subject) === normalize(groupName));
+  const matches = Object.values(groups).filter((group) => normalize(group.subject) === normalize(definition.name));
   if (matches.length === 1) {
-    targetGroupJid = matches[0].id;
-    console.log(`[grupo] Grupo autorizado encontrado: ${matches[0].subject}`);
-    return targetGroupJid;
+    definition.jid = matches[0].id;
+    console.log(`[grupo] Grupo ${role} encontrado: ${matches[0].subject}`);
+    return definition.jid;
   }
 
   if (!matches.length) {
-    console.log(`[grupo] Aguardando o número ser adicionado ao grupo “${groupName}”.`);
+    console.log(`[grupo] Aguardando o número ser adicionado ao grupo “${definition.name}”.`);
   } else {
-    console.log(`[grupo] Existem ${matches.length} grupos com o nome “${groupName}”. Configure WHATSAPP_GROUP_JID.`);
+    console.log(`[grupo] Existem ${matches.length} grupos com o nome “${definition.name}”. Configure o JID específico.`);
   }
   return null;
 }
 
-async function groupIsAuthorized(jid) {
-  const target = await resolveTargetGroup();
-  if (target) return target === jid;
+async function identifyGroup(jid) {
+  const configured = Object.entries(groupDefinitions).find(([, definition]) => definition.jid === jid);
+  if (configured) return configured[0];
 
   try {
     const metadata = await socket.groupMetadata(jid);
-    if (normalize(metadata.subject) === normalize(groupName)) {
-      targetGroupJid = jid;
-      console.log(`[grupo] Grupo autorizado definido: ${metadata.subject}`);
-      return true;
+    const match = Object.entries(groupDefinitions).find(([, definition]) => normalize(metadata.subject) === normalize(definition.name));
+    if (match) {
+      match[1].jid = jid;
+      console.log(`[grupo] Grupo ${match[0]} definido: ${metadata.subject}`);
+      return match[0];
     }
   } catch (error) {
     logger.warn({ error }, "Não foi possível conferir o grupo");
   }
-  return false;
+  return null;
 }
 
 async function sendText(jid, text) {
@@ -104,9 +108,9 @@ async function sendText(jid, text) {
 }
 
 async function sendReport(mode, { scheduled = false } = {}) {
-  const jid = await resolveTargetGroup();
+  const jid = await resolveGroup("report");
   if (!jid) {
-    if (!scheduled) throw new Error(`Grupo “${groupName}” ainda não encontrado`);
+    if (!scheduled) throw new Error(`Grupo “${groupDefinitions.report.name}” ainda não encontrado`);
     return;
   }
 
@@ -135,15 +139,60 @@ function startSchedules() {
     }
   }, { timezone });
 
+  cron.schedule("5 18 * * *", async () => {
+    try {
+      const jid = await resolveGroup("report");
+      if (!jid) return;
+      await sendText(jid, formatFinanceSummary(await ledger.summary()));
+    } catch (error) {
+      logger.error({ error }, "Falha no resumo financeiro automático");
+    }
+  }, { timezone });
+
   console.log(`[agenda] Relatórios automáticos ativos em ${timezone}.`);
 }
 
-async function handleCommand(message) {
-  const jid = message.key.remoteJid;
-  if (!jid?.endsWith("@g.us")) return;
-  if (!(await groupIsAuthorized(jid))) return;
+const financialHandler = createFinancialHandler({
+  ledger,
+  logger,
+  getSocket: () => socket,
+  sendText
+});
+const financeNumbers = String(process.env.FINANCE_WHATSAPP_NUMBERS || "")
+  .split(",")
+  .map((value) => value.replace(/\D/g, ""))
+  .filter(Boolean);
 
-  const text = extractText(message);
+function senderNumber(message) {
+  return String(message.key.participant || message.participant || "")
+    .split("@")[0]
+    .split(":")[0]
+    .replace(/\D/g, "");
+}
+
+function financeUserAuthorized(message) {
+  const sender = senderNumber(message);
+  return Boolean(sender) && financeNumbers.some((number) => sender === number || sender.endsWith(number) || number.endsWith(sender));
+}
+
+async function sendPending(jid) {
+  const pending = await ledger.recent({ date: localDateKey(new Date(), timezone), status: "needs_review", limit: 15 });
+  if (!pending.length) {
+    await sendText(jid, "✅ Nenhum comprovante aguardando revisão hoje.");
+    return;
+  }
+  await sendText(jid, [
+    "⚠️ *COMPROVANTES AGUARDANDO REVISÃO*",
+    "",
+    ...pending.map((entry) => `• *${entry.id}* — ${entry.clientName || "cliente não identificado"} — ${entry.amount != null ? new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(entry.amount) : "sem valor"}`),
+    "",
+    "Após conferir no banco: /confirmar CÓDIGO"
+  ].join("\n"));
+}
+
+async function handleCommand(message, role) {
+  const jid = message.key.remoteJid;
+  const text = textFromMessage(message);
   const command = text.split(/\s+/)[0].toLowerCase();
   const modes = {
     "/atualizar": "full",
@@ -160,18 +209,56 @@ async function handleCommand(message) {
       "/resumo — resumo geral",
       "/linhas — desempenho das RP1 a RP5",
       "/alertas — ingressos sem classificação",
+      "/financeiro — entradas e saídas do dia",
+      "/entradas — comprovantes de entrada do dia",
+      "/saidas — comprovantes de saída do dia",
+      "/pendentes — comprovantes que precisam de revisão",
+      "/confirmar CÓDIGO — confirmar após conferir no banco",
       "/status — verificar conexão"
     ].join("\n"));
-    return;
+    return true;
   }
 
   if (command === "/status") {
-    await sendText(jid, "✅ Bot conectado e pronto para atualizar os relatórios.");
-    return;
+    const groupStatus = Object.values(groupDefinitions).map((definition) => `${definition.jid ? "✅" : "⏳"} ${definition.name}`);
+    await sendText(jid, ["✅ Bot conectado e pronto.", "", ...groupStatus].join("\n"));
+    return true;
+  }
+
+  if (["/financeiro", "/movimentos", "/entradas", "/saidas", "/saídas"].includes(command)) {
+    const kind = command === "/entradas" ? "incoming" : ["/saidas", "/saídas"].includes(command) ? "outgoing" : undefined;
+    await sendText(jid, formatFinanceSummary(await ledger.summary({ kind }), kind));
+    return true;
+  }
+
+  if (command === "/pendentes") {
+    await sendPending(jid);
+    return true;
+  }
+
+  if (command === "/confirmar") {
+    if (!financeNumbers.length) {
+      await sendText(jid, "🔒 A confirmação bancária ainda não tem números autorizados configurados.");
+      return true;
+    }
+    if (!financeUserAuthorized(message)) {
+      await sendText(jid, "🔒 Apenas o financeiro autorizado pode confirmar uma entrada ou saída.");
+      return true;
+    }
+    const id = text.split(/\s+/)[1];
+    if (!id) {
+      await sendText(jid, "Use: /confirmar CÓDIGO");
+      return true;
+    }
+    const confirmed = await ledger.confirm(id, senderNumber(message));
+    await sendText(jid, confirmed
+      ? `✅ *${confirmed.id}* confirmado após conferência bancária.`
+      : `❌ Código *${id}* não encontrado.`);
+    return true;
   }
 
   const mode = modes[command];
-  if (!mode) return;
+  if (!mode || role !== "report") return false;
 
   await socket.sendPresenceUpdate("composing", jid);
   try {
@@ -183,6 +270,21 @@ async function handleCommand(message) {
   } finally {
     await socket.sendPresenceUpdate("paused", jid);
   }
+  return true;
+}
+
+async function handleMessage(message) {
+  const jid = message.key.remoteJid;
+  if (!jid?.endsWith("@g.us") || message.key.fromMe) return;
+  const role = await identifyGroup(jid);
+  if (!role) return;
+
+  const text = textFromMessage(message);
+  if (text.startsWith("/") && await handleCommand(message, role)) return;
+  if (role === "report") return;
+
+  const kind = role === "incoming" ? "incoming" : "outgoing";
+  await financialHandler.handle(message, { kind, groupName: groupDefinitions[role].name });
 }
 
 async function connect() {
@@ -206,9 +308,13 @@ async function connect() {
     if (type !== "notify") return;
     for (const message of messages) {
       try {
-        await handleCommand(message);
+        await handleMessage(message);
       } catch (error) {
         logger.error({ error }, "Falha ao processar mensagem");
+        const jid = message.key.remoteJid;
+        if (jid?.endsWith("@g.us")) {
+          await sendText(jid, `❌ Não foi possível ler este comprovante: ${error.message || "erro desconhecido"}`).catch(() => {});
+        }
       }
     }
   });
@@ -225,7 +331,7 @@ async function connect() {
       state.connected = true;
       state.qr = null;
       console.log("[whatsapp] Conectado com sucesso.");
-      await resolveTargetGroup();
+      for (const role of Object.keys(groupDefinitions)) await resolveGroup(role);
       startSchedules();
       return;
     }
@@ -249,7 +355,23 @@ async function connect() {
 process.on("unhandledRejection", (error) => logger.error({ error }, "Erro não tratado"));
 process.on("uncaughtException", (error) => logger.fatal({ error }, "Erro fatal"));
 
-connect().catch((error) => {
+async function shutdown(signal) {
+  console.log(`[sistema] Encerrando por ${signal}…`);
+  clearTimeout(reconnectTimer);
+  await terminateOcr().catch(() => {});
+  process.exit(0);
+}
+
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
+
+async function main() {
+  await ledger.initialize();
+  startServer(state, { ledger });
+  await connect();
+}
+
+main().catch((error) => {
   logger.fatal({ error }, "Não foi possível iniciar o WhatsApp");
   process.exitCode = 1;
 });

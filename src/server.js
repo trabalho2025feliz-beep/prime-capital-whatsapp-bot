@@ -39,6 +39,22 @@ function pairingAuthorized(request, url) {
   }
 }
 
+function financeAuthorized(request) {
+  const expected = process.env.LEDGER_API_SECRET;
+  if (!expected) return false;
+  const header = String(request.headers.authorization || "");
+  if (!header.startsWith("Bearer ")) return false;
+  return safeEqual(header.slice(7), expected);
+}
+
+function sendJson(response, status, payload) {
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  response.end(JSON.stringify(payload));
+}
+
 function htmlPage(title, body, refresh = false) {
   return `<!doctype html>
 <html lang="pt-BR">
@@ -66,7 +82,7 @@ function htmlPage(title, body, refresh = false) {
 </html>`;
 }
 
-export function startServer(state) {
+export function startServer(state, { ledger } = {}) {
   const port = Number(process.env.PORT || 3000);
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
@@ -77,6 +93,49 @@ export function startServer(state) {
         ok: true,
         whatsapp: state.connected ? "connected" : state.qr ? "waiting_for_qr" : "starting"
       }));
+      return;
+    }
+
+    if (url.pathname.startsWith("/api/finance/")) {
+      if (request.method !== "GET") {
+        sendJson(response, 405, { ok: false, error: "Método não permitido" });
+        return;
+      }
+      if (!process.env.LEDGER_API_SECRET) {
+        sendJson(response, 503, { ok: false, error: "API financeira não configurada" });
+        return;
+      }
+      if (!financeAuthorized(request)) {
+        sendJson(response, 401, { ok: false, error: "Não autorizado" });
+        return;
+      }
+      if (!ledger) {
+        sendJson(response, 503, { ok: false, error: "Armazenamento financeiro indisponível" });
+        return;
+      }
+
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("date") || "")
+        ? url.searchParams.get("date")
+        : undefined;
+      const kind = ["incoming", "outgoing"].includes(url.searchParams.get("kind"))
+        ? url.searchParams.get("kind")
+        : undefined;
+      try {
+        if (url.pathname === "/api/finance/summary") {
+          sendJson(response, 200, { ok: true, summary: await ledger.summary({ date, kind }) });
+          return;
+        }
+        if (url.pathname === "/api/finance/recent") {
+          sendJson(response, 200, {
+            ok: true,
+            entries: await ledger.recent({ date, kind, status: url.searchParams.get("status") || undefined, limit: url.searchParams.get("limit") })
+          });
+          return;
+        }
+        sendJson(response, 404, { ok: false, error: "Rota não encontrada" });
+      } catch (error) {
+        sendJson(response, 500, { ok: false, error: error.message || "Falha interna" });
+      }
       return;
     }
 
