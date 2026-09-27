@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "check": "node --check src/index.js && node --check src/report-client.js && node --check src/server.js && node --check src/financial-handler.js && node --check src/finance-ledger.js && node --check src/receipt-parser.js",
+    "check": "node --check src/index.js && node --check src/report-client.js && node --check src/server.js && node --check src/financial-handler.js && node --check src/finance-ledger.js && node --check src/receipt-parser.js && node --check src/agenda-handler.js && node --check src/agenda-ledger.js && node --check src/agenda-vision.js",
     "test": "node --test"
   },
   "dependencies": {
