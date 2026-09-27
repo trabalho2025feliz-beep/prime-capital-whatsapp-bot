@@ -82,7 +82,7 @@ function htmlPage(title, body, refresh = false) {
 </html>`;
 }
 
-export function startServer(state, { ledger } = {}) {
+export function startServer(state, { ledger, agendaLedger } = {}) {
   const port = Number(process.env.PORT || 3000);
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
@@ -96,7 +96,7 @@ export function startServer(state, { ledger } = {}) {
       return;
     }
 
-    if (url.pathname.startsWith("/api/finance/")) {
+    if (url.pathname.startsWith("/api/finance/") || url.pathname.startsWith("/api/agenda/")) {
       if (request.method !== "GET") {
         sendJson(response, 405, { ok: false, error: "Método não permitido" });
         return;
@@ -109,8 +109,12 @@ export function startServer(state, { ledger } = {}) {
         sendJson(response, 401, { ok: false, error: "Não autorizado" });
         return;
       }
-      if (!ledger) {
+      if (url.pathname.startsWith("/api/finance/") && !ledger) {
         sendJson(response, 503, { ok: false, error: "Armazenamento financeiro indisponível" });
+        return;
+      }
+      if (url.pathname.startsWith("/api/agenda/") && !agendaLedger) {
+        sendJson(response, 503, { ok: false, error: "Armazenamento das agendas indisponível" });
         return;
       }
 
@@ -119,6 +123,9 @@ export function startServer(state, { ledger } = {}) {
         : undefined;
       const kind = ["incoming", "outgoing"].includes(url.searchParams.get("kind"))
         ? url.searchParams.get("kind")
+        : undefined;
+      const line = /^(?:RP)?[1-5]$/i.test(url.searchParams.get("line") || "")
+        ? `RP${String(url.searchParams.get("line")).replace(/\D/g, "")}`
         : undefined;
       try {
         if (url.pathname === "/api/finance/summary") {
@@ -129,6 +136,17 @@ export function startServer(state, { ledger } = {}) {
           sendJson(response, 200, {
             ok: true,
             entries: await ledger.recent({ date, kind, status: url.searchParams.get("status") || undefined, limit: url.searchParams.get("limit") })
+          });
+          return;
+        }
+        if (url.pathname === "/api/agenda/summary") {
+          sendJson(response, 200, { ok: true, summary: await agendaLedger.summary({ date, line }) });
+          return;
+        }
+        if (url.pathname === "/api/agenda/pending") {
+          sendJson(response, 200, {
+            ok: true,
+            entries: await agendaLedger.pending({ date, line, limit: url.searchParams.get("limit") })
           });
           return;
         }
