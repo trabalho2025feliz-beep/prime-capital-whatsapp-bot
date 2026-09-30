@@ -10,7 +10,7 @@ RUN npm ci --omit=dev
 COPY src ./src
 
 # Isolated test application. The official src/index.js is not started.
-COPY prime-test-runtime.mjs start-test.mjs workflow.test.mjs ./
+COPY prime-test-*.mjs start-test.mjs workflow.test.mjs ./
 RUN node --check prime-test-runtime.mjs && node --check start-test.mjs && node --test workflow.test.mjs
 
 ENV NODE_ENV=production
