@@ -1,3 +1,3 @@
-import { LiveEngine, LIVE_VERSION } from './prime-live.mjs';
+import { DualEngine, RELEASE } from './prime-live-sandbox.mjs';
 import { startLive } from './prime-live-transport.mjs';
-await startLive(LiveEngine, LIVE_VERSION);
+await startLive(DualEngine, RELEASE);
