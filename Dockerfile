@@ -13,10 +13,13 @@ COPY src ./src
 COPY prime-test-*.mjs start-test.mjs workflow.test.mjs ./
 RUN node --check prime-test-runtime.mjs && node --check start-test.mjs && node --test workflow.test.mjs
 
+COPY prime-live*.mjs start-live.mjs ./
+RUN node --check start-live.mjs && node --check prime-live-transport.mjs && node prime-live.mjs --self-test && node --test prime-live.extended.test.mjs
+
 ENV NODE_ENV=production
 ENV AUTH_DIR=/data/whatsapp-auth
 ENV TZ=America/Sao_Paulo
 
 EXPOSE 3000
 
-CMD ["node", "start-test.mjs"]
+CMD ["node", "start-live.mjs"]
