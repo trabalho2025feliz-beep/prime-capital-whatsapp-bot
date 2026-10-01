@@ -60,7 +60,7 @@ export class LiveEngine extends Engine {
  }
  id(rp) { return super.id(rp).replace('TESTE-',''); }
  target(e) {
-  const written = String(e.text).match(/\bPRIME-[0-9]{6}-(?:RP[1-5]|ADM)-[0-9]{4,}\b/)?.[0];
+  const written = String(e.text).match(/\bPRIME-[0-9]{6}-(?:RP[1-5]|ADM)-[0-9]{4,}\b)?.[0];
   if (String(e.text).includes('TESTE-PRIME-')) throw Error('ID de teste nao pode ser usado na operacao.');
   const q = e.quoteId && (this.s.messages[`${e.group}|${e.quoteId}`]?.operation || this.s.outbound[`${e.group}|${e.quoteId}`]?.operation);
   if (written && q && written !== q) throw Error('ID e mensagem respondida nao correspondem.');
@@ -78,7 +78,7 @@ export class LiveEngine extends Engine {
   super.status(o);
  }
  view(o) {
-  return [`ID: ${o.id}`,`RP: ${o.rp}`,`${o.type}: ${o.client || o.description}`,`Valor: ${new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(o.value/100)}`,`Status: ${o.status}`,o.flags.length ? 'Pendencias: '+o.flags.join('; ') : '', 'Confirmacao humana do financeiro. Try e banco nao consultados pelo bot.'].filter(Boolean).join(NL);
+  return [`ID: ${o.id}`,'RP: '+o.rp,`${o.type}: ${o.client || o.description}`,'Valor: '+new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(o.value/100),`Status: ${o.status}`,o.flags.length ? 'Pendencias: '+o.flags.join('; ') : '', 'Confirmacao humana do financeiro. Try e banco nao consultados pelo bot.'].filter(Boolean).join(NL);
  }
  summary(q='') {
   if (/SEMANA|MES PASSADO/.test(norm(q))) throw Error('Informe o periodo com datas DD/MM/AAAA para evitar consulta ambigua.');
@@ -90,7 +90,7 @@ export class LiveEngine extends Engine {
  }
  async execute(e) {
   if (this.s.groups[e.group] !== e.role) throw Error('Grupo nao autorizado.');
-  const n = norm(e.text).replace(/^\//,''), f = fields(e.text);
+  const n = norm(e.text).replace(/^//,''), f = fields(e.text);
   if (['STATUS','DIAGNOSTICO'].includes(n)) return {text:[LIVE_VERSION, 'Estado: '+this.s.phase, 'Financeiro neste envio: '+(this.isFinance(e)?'RECONHECIDO':e.phone?'OUTRO NUMERO':'TELEFONE NAO RESOLVIDO'), 'Grupos configurados: 4. Confirmacao financeira exclusiva para o numero cadastrado.', 'Inicio: '+(this.s.openedAt || 'pendente'), 'Base operacional separada. Try/banco nao integrados.'].join(NL)};
   if (['AJUDA','COMANDOS'].includes(n)) return {text:this.help()};
   if (/^(MODO TESTE|INICIAR TESTES|FINALIZAR TESTES|COMPROVANTE SIMULADO)/.test(n) || n.includes('TESTE-PRIME-')) throw Error('Comando de teste bloqueado nesta base. Nenhuma simulacao sera contabilizada.');
@@ -120,6 +120,7 @@ export class LiveEngine extends Engine {
   if (/^(OK|CONFERIDO|CONFIRMAR|VALIDAR COMPROVANTE)/.test(n)) {
    const o = this.target(e);
    if (o.group !== e.group) throw Error('Confirme no grupo original da operacao.');
+   if (o.status === 'CONFIRMADO') return {text:this.view(o), operation:o.id};
    if (n.startsWith('VALIDAR')) {
     if (!o.proof || o.proof.simulated) throw Error('Anexe o comprovante primeiro.');
     if (['scheduled','cancelled'].includes(o.proof.settlement)) throw Error('Comprovante agendado/cancelado nao pode ser aprovado. Envie evidencia de transacao concluida.');
@@ -135,14 +136,21 @@ export class LiveEngine extends Engine {
     if (required.some(a => !this.s.accounts.some(x => x.date === this.today() && x.key === norm(a)))) throw Error('Financeiro: registre a abertura das contas envolvidas antes da confirmacao.');
    }
   }
+  if (e.proof) {
+   const creates = /^(ENTRADA|VENDA|SAIDA|RENOVACAO|RETORNO|APORTE|RETIRADA|TRANSFERENCIA INTERNA)([ :]|$)|^CODIGO *:/.test(n.split(NL)[0]);
+   if (!creates) {
+    const original = this.target(e);
+    if (original.status === 'CONFIRMADO') return {text:this.view(original), operation:original.id};
+    if (original.approval) {
+     original.approval=null;
+     this.event(e,'PROOF_REQUIRES_NEW_APPROVAL',original);
+    }
+   }
+  }
   const r = await super.execute(e);
   if (r?.text) r.text = r.text.replace(/no TESTE/g,'na operacao').replace(/somente para TESTE/gi,'para consulta').replace(/em TESTE/g,'na operacao').replace('Somente teste. Finalizar testes não ativa produção. Validação no WhatsApp e conciliação bancária ainda exigem conferência humana.', 'Operacao assistida. Conferencia bancaria humana obrigatoria.');
   return r;
  }
-}
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url) && !process.argv.includes('--self-test')) {
- const { startLive } = await import('./prime-live-transport.mjs');
- await startLive(LiveEngine, LIVE_VERSION);
 }
 
 export async function runChecks() {
