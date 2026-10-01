@@ -60,7 +60,7 @@ export class LiveEngine extends Engine {
  }
  id(rp) { return super.id(rp).replace('TESTE-',''); }
  target(e) {
-  const written = String(e.text).match(/\bPRIME-[0-9]{6}-(?:RP[1-5]|ADM)-[0-9]{4,}\b)?.[0];
+  const written = String(e.text).match(/(?:^|[^A-Z0-9-])(PRIME-[0-9]{6}-(?:RP[1-5]|ADM)-[0-9]{4,})(?![A-Z0-9-])/i)?.[1]?.toUpperCase();
   if (String(e.text).includes('TESTE-PRIME-')) throw Error('ID de teste nao pode ser usado na operacao.');
   const q = e.quoteId && (this.s.messages[`${e.group}|${e.quoteId}`]?.operation || this.s.outbound[`${e.group}|${e.quoteId}`]?.operation);
   if (written && q && written !== q) throw Error('ID e mensagem respondida nao correspondem.');
@@ -90,7 +90,7 @@ export class LiveEngine extends Engine {
  }
  async execute(e) {
   if (this.s.groups[e.group] !== e.role) throw Error('Grupo nao autorizado.');
-  const n = norm(e.text).replace(/^//,''), f = fields(e.text);
+  const n = norm(e.text).replace(/^[/]/,''), f = fields(e.text);
   if (['STATUS','DIAGNOSTICO'].includes(n)) return {text:[LIVE_VERSION, 'Estado: '+this.s.phase, 'Financeiro neste envio: '+(this.isFinance(e)?'RECONHECIDO':e.phone?'OUTRO NUMERO':'TELEFONE NAO RESOLVIDO'), 'Grupos configurados: 4. Confirmacao financeira exclusiva para o numero cadastrado.', 'Inicio: '+(this.s.openedAt || 'pendente'), 'Base operacional separada. Try/banco nao integrados.'].join(NL)};
   if (['AJUDA','COMANDOS'].includes(n)) return {text:this.help()};
   if (/^(MODO TESTE|INICIAR TESTES|FINALIZAR TESTES|COMPROVANTE SIMULADO)/.test(n) || n.includes('TESTE-PRIME-')) throw Error('Comando de teste bloqueado nesta base. Nenhuma simulacao sera contabilizada.');
